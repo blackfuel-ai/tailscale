@@ -15,7 +15,14 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/tailscale/netlink"
+	"go4.org/netipx"
 	"tailscale.com/util/linuxfw"
+)
+
+const (
+	// tailscaleRouteTable is the routing table number used by Tailscale.
+	tailscaleRouteTable = 52
 )
 
 // ensureIPForwarding enables IPv4/IPv6 forwarding for the container.
@@ -123,6 +130,36 @@ func installEgressForwardingRule(_ context.Context, dstStr string, tsIPs []netip
 	if err := nfr.ClampMSSToPMTU("tailscale0", dst); err != nil {
 		return fmt.Errorf("installing egress proxy rules: %w", err)
 	}
+	// Add route to table 52 for the destination via tailscale0.
+	// This is needed for Tailscale Services which are not WireGuard peers
+	// and thus don't have routes added by tailscaled.
+	// We log a warning but don't fail if this fails, since for regular
+	// Tailscale peers, tailscaled already manages routes.
+	if err := addRouteForEgressDestination(dst); err != nil {
+		log.Printf("[warning] failed to add route for egress destination %v: %v", dst, err)
+	}
+	return nil
+}
+
+// addRouteForEgressDestination adds a route for the given destination IP
+// to routing table 52 via the tailscale0 interface. This ensures that
+// traffic to Tailscale Services (which are not WireGuard peers) is routed
+// through the Tailscale interface rather than the default gateway.
+func addRouteForEgressDestination(dst netip.Addr) error {
+	link, err := netlink.LinkByName("tailscale0")
+	if err != nil {
+		return fmt.Errorf("getting tailscale0 link: %w", err)
+	}
+	dstPrefix := netip.PrefixFrom(dst, dst.BitLen())
+	route := &netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Dst:       netipx.PrefixIPNet(dstPrefix),
+		Table:     tailscaleRouteTable,
+	}
+	if err := netlink.RouteReplace(route); err != nil {
+		return fmt.Errorf("adding route %v to table %d: %w", dstPrefix, tailscaleRouteTable, err)
+	}
+	log.Printf("Added route for %v via tailscale0 to table %d", dst, tailscaleRouteTable)
 	return nil
 }
 
