@@ -906,40 +906,22 @@ func resolveTailnetFQDN(nm *netmap.NetworkMap, fqdn string) ([]netip.Prefix, err
 }
 
 // serviceIPsFromNetMap returns all IPs of a Tailscale Service if its FQDN is
-// found in the netmap. Note that Tailscale Services are not a first-class
-// object in the netmap, so we guess based on DNS ExtraRecords and AllowedIPs.
+// found in the netmap's DNS ExtraRecords. Tailscale Services are identified by
+// their DNS records rather than AllowedIPs advertisements from peers.
 func serviceIPsFromNetMap(nm *netmap.NetworkMap, fqdn dnsname.FQDN) []netip.Prefix {
-	var extraRecords []tailcfg.DNSRecord
+	var prefixes []netip.Prefix
 	for _, rec := range nm.DNS.ExtraRecords {
 		recFQDN, err := dnsname.ToFQDN(rec.Name)
 		if err != nil {
 			continue
 		}
 		if strings.EqualFold(fqdn.WithTrailingDot(), recFQDN.WithTrailingDot()) {
-			extraRecords = append(extraRecords, rec)
-		}
-	}
-
-	if len(extraRecords) == 0 {
-		return nil
-	}
-
-	// Validate we can see a peer advertising the Tailscale Service.
-	var prefixes []netip.Prefix
-	for _, extraRecord := range extraRecords {
-		ip, err := netip.ParseAddr(extraRecord.Value)
-		if err != nil {
-			continue
-		}
-		ipPrefix := netip.PrefixFrom(ip, ip.BitLen())
-		for _, ps := range nm.Peers {
-			for _, allowedIP := range ps.AllowedIPs().All() {
-				if allowedIP == ipPrefix {
-					prefixes = append(prefixes, ipPrefix)
-				}
+			ip, err := netip.ParseAddr(rec.Value)
+			if err != nil {
+				continue
 			}
+			prefixes = append(prefixes, netip.PrefixFrom(ip, ip.BitLen()))
 		}
 	}
-
 	return prefixes
 }
