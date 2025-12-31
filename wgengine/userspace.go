@@ -763,6 +763,24 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Node
 	full := e.lastCfgFull
 	e.wgLogger.SetPeers(full.Peers)
 
+	// Build a set of Service IPs from DNS ExtraRecords.
+	// Peers advertising these IPs should not be trimmed as they handle
+	// Tailscale Service traffic that may arrive via kernel routing
+	// (e.g., egress proxy use case).
+	serviceIPs := make(map[netip.Addr]bool)
+	e.mu.Lock()
+	if nm := e.netMap; nm != nil && len(nm.DNS.ExtraRecords) > 0 {
+		for _, rec := range nm.DNS.ExtraRecords {
+			if ip, err := netip.ParseAddr(rec.Value); err == nil {
+				serviceIPs[ip] = true
+			}
+		}
+	}
+	e.mu.Unlock()
+	if len(serviceIPs) > 0 {
+		e.logf("[v1] wgengine: found %d Service IPs in DNS ExtraRecords", len(serviceIPs))
+	}
+
 	// Compute a minimal config to pass to wireguard-go
 	// based on the full config. Prune off all the peers
 	// and only add the active ones back.
@@ -802,7 +820,22 @@ func (e *userspaceEngine) maybeReconfigWireguardLocked(discoChanged map[key.Node
 	for i := range full.Peers {
 		p := &full.Peers[i]
 		nk := p.PublicKey
-		if !buildfeatures.HasLazyWG || !e.isTrimmablePeer(p, len(full.Peers)) {
+
+		// Check if this peer advertises any Service IPs.
+		// Service endpoint peers must always be configured in WireGuard
+		// to handle traffic routed by the kernel to Service IPs.
+		advertizesServiceIP := false
+		if len(serviceIPs) > 0 {
+			for _, allowedIP := range p.AllowedIPs {
+				if serviceIPs[allowedIP.Addr()] {
+					advertizesServiceIP = true
+					e.logf("[v1] wgengine: peer %v advertises Service IP %v, marking as non-trimmable", nk.ShortString(), allowedIP.Addr())
+					break
+				}
+			}
+		}
+
+		if !buildfeatures.HasLazyWG || advertizesServiceIP || !e.isTrimmablePeer(p, len(full.Peers)) {
 			min.Peers = append(min.Peers, *p)
 			if discoChanged[nk] {
 				needRemoveStep = true
